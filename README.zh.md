@@ -136,6 +136,33 @@ bash scripts/service.sh logs
 
 同一个飞书应用只能运行一个长连接服务实例。部署到 NAS 后，必须停止本机或其他机器上的同应用实例，避免飞书事件被多个客户端分流。
 
+## Git 仓库与更新
+
+NAS 上的长期目录约定：
+
+```text
+/workspace/nas-data/git/feishu-codex-agent.git   # 裸仓库，主版本
+/workspace/nas-data/apps/feishu-codex-agent      # 运行中的部署目录
+```
+
+开发机推送：
+
+```bash
+git push nas main
+```
+
+NAS 拉取并重启：
+
+```bash
+cd /workspace/nas-data/apps/feishu-codex-agent
+git pull --ff-only
+npm ci
+npm run build
+bash scripts/service.sh restart
+```
+
+本机 Git 使用系统 OpenSSH 与 `notebook` 主机别名连接 NAS。密钥带口令时，推送前需确保 Windows `ssh-agent` 已加载对应密钥。
+
 ## 安全边界
 
 默认配置使用：

@@ -1,8 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-interface SessionRecord {
-  threadId: string;
+export type SessionSandbox = "read-only" | "workspace-write";
+
+export interface SessionRecord {
+  threadId?: string;
+  model?: string;
+  sandbox?: SessionSandbox;
   updatedAt: string;
 }
 
@@ -27,10 +31,51 @@ export class SessionStore {
 
   async setThreadId(chatId: string, threadId: string): Promise<void> {
     const data = await this.read();
-    data.sessions[chatId] = {
-      threadId,
-      updatedAt: new Date().toISOString(),
-    };
+    const record = this.ensureRecord(data, chatId);
+    record.threadId = threadId;
+    record.updatedAt = new Date().toISOString();
+    await this.write(data);
+  }
+
+  async setModel(chatId: string, model: string | undefined): Promise<void> {
+    const data = await this.read();
+    const record = this.ensureRecord(data, chatId);
+    if (model) {
+      record.model = model;
+    } else {
+      delete record.model;
+    }
+    record.updatedAt = new Date().toISOString();
+    this.removeIfEmpty(data, chatId, record);
+    await this.write(data);
+  }
+
+  async setSandbox(
+    chatId: string,
+    sandbox: SessionSandbox | undefined,
+  ): Promise<void> {
+    const data = await this.read();
+    const record = this.ensureRecord(data, chatId);
+    if (sandbox) {
+      record.sandbox = sandbox;
+    } else {
+      delete record.sandbox;
+    }
+    record.updatedAt = new Date().toISOString();
+    this.removeIfEmpty(data, chatId, record);
+    await this.write(data);
+  }
+
+  async resetThread(chatId: string): Promise<void> {
+    const data = await this.read();
+    const record = data.sessions[chatId];
+    if (!record) {
+      return;
+    }
+
+    delete record.threadId;
+    record.updatedAt = new Date().toISOString();
+    this.removeIfEmpty(data, chatId, record);
     await this.write(data);
   }
 
@@ -42,6 +87,29 @@ export class SessionStore {
 
     delete data.sessions[chatId];
     await this.write(data);
+  }
+
+  private ensureRecord(data: SessionFile, chatId: string): SessionRecord {
+    const existing = data.sessions[chatId];
+    if (existing) {
+      return existing;
+    }
+
+    const record: SessionRecord = {
+      updatedAt: new Date().toISOString(),
+    };
+    data.sessions[chatId] = record;
+    return record;
+  }
+
+  private removeIfEmpty(
+    data: SessionFile,
+    chatId: string,
+    record: SessionRecord,
+  ): void {
+    if (!record.threadId && !record.model && !record.sandbox) {
+      delete data.sessions[chatId];
+    }
   }
 
   private async read(): Promise<SessionFile> {

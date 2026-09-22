@@ -1,16 +1,23 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import process from "node:process";
 import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
-import { CodexRunner } from "./codex-runner.js";
-import { loadConfig } from "./config.js";
 import {
-  isHelpCommand,
-  isNewCommand,
-  isStatusCommand,
+  CodexRunner,
+  RunCancelledError,
+} from "./codex-runner.js";
+import { loadConfig, type SupportedSandbox } from "./config.js";
+import {
+  parseSlashCommand,
   truncateText,
   workspaceForChat,
+  type ParsedSlashCommand,
 } from "./util.js";
+import {
+  listWorkspaceFiles,
+  runWorkspaceGit,
+} from "./workspace-tools.js";
 
 function log(event: string, fields: Record<string, unknown> = {}): void {
   console.log(
@@ -20,6 +27,14 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
       ...fields,
     }),
   );
+}
+
+function markdownCode(value: string): string {
+  return value.replaceAll("`", "'");
+}
+
+function isSupportedSandbox(value: string): value is SupportedSandbox {
+  return value === "read-only" || value === "workspace-write";
 }
 
 const config = loadConfig();
@@ -55,8 +70,10 @@ const channel = createLarkChannel({
       ttl: 6 * 60 * 60 * 1000,
       maxEntries: 10000,
     },
+    // CodexRunner owns per-chat ordering. Keeping the Lark queue off allows
+    // control commands such as /cancel to run while a Codex turn is active.
     chatQueue: {
-      enabled: true,
+      enabled: false,
     },
     batch: {
       text: {
@@ -95,105 +112,289 @@ const server = createServer((request, response) => {
 });
 
 const helpText = [
-  "可用命令：",
-  "- `/new`：清空当前 Codex 会话",
-  "- `/status`：查看当前会话和工作目录",
-  "- `/help`：显示本帮助",
+  "**会话**",
+  "- `/new`：清空当前 Codex 会话，保留模型和模式",
+  "- `/status`：查看会话、模型、模式、目录和运行状态",
+  "- `/cancel`：取消当前正在执行的 Codex 任务",
   "",
-  "其他消息会转给远程 Codex。单聊默认只允许应用创建者；群聊需要先加入 `FEISHU_ALLOWED_CHAT_IDS`，并 @ 机器人。",
+  "**开发**",
+  "- `/files [路径]`：查看当前 workspace 内的文件",
+  "- `/git status|log|diff`：查看 Git 状态、提交或变更统计",
+  "- `/review [要求]`：让 Codex 审查当前 workspace",
+  "",
+  "**配置**",
+  "- `/model`：查看当前模型",
+  "- `/model <名称>`：切换当前聊天模型",
+  "- `/model default`：恢复服务默认模型",
+  "- `/mode`：查看当前沙箱模式",
+  "- `/mode read-only|workspace-write`：切换当前聊天模式",
+  "- `/mode default`：恢复服务默认模式",
+  "",
+  "其他消息会交给远程 Codex。群聊需要先授权，并 @ 机器人。",
 ].join("\n");
+
+interface ReplyTarget {
+  chatId: string;
+  messageId: string;
+  threadId?: string;
+}
+
+async function sendText(
+  target: ReplyTarget,
+  text: string,
+): Promise<void> {
+  await channel.send(target.chatId, { text }, {
+    replyTo: target.messageId,
+    ...(target.threadId ? { replyInThread: true } : {}),
+  });
+}
+
+async function sendMarkdown(
+  target: ReplyTarget,
+  markdown: string,
+): Promise<void> {
+  await channel.send(target.chatId, { markdown }, {
+    replyTo: target.messageId,
+    ...(target.threadId ? { replyInThread: true } : {}),
+  });
+}
+
+async function executePrompt(
+  target: ReplyTarget,
+  prompt: string,
+): Promise<void> {
+  await sendText(target, "Codex 已收到任务，正在处理...");
+
+  void (async () => {
+    try {
+      const result = await runner.run(target.chatId, prompt);
+      const responseText =
+        result.finalResponse.trim() || "Codex 没有返回文本结果。";
+      await sendMarkdown(
+        { ...target, ...(result.threadId ? { threadId: result.threadId } : {}) },
+        truncateText(responseText, 100000),
+      );
+      log("run.completed", {
+        chatId: target.chatId,
+        threadId: result.threadId,
+      });
+    } catch (error) {
+      if (error instanceof RunCancelledError) {
+        await sendText(target, "当前 Codex 任务已取消。");
+        log("run.cancelled", { chatId: target.chatId });
+        return;
+      }
+
+      const messageText =
+        error instanceof Error ? error.message : String(error);
+      const errorId = randomUUID();
+      await sendText(
+        target,
+        `Codex 执行失败。请将错误编号提供给管理员：${errorId}`,
+      );
+      log("run.failed", {
+        errorId,
+        chatId: target.chatId,
+        error: messageText,
+      });
+    }
+  })();
+}
+
+async function handleCommand(
+  target: ReplyTarget,
+  command: ParsedSlashCommand,
+): Promise<void> {
+  switch (command.name) {
+    case "help":
+      await sendMarkdown(target, helpText);
+      return;
+
+    case "new":
+    case "reset":
+    case "clear":
+      runner.cancel(target.chatId);
+      await runner.reset(target.chatId);
+      await sendText(
+        target,
+        "已开启新的 Codex 会话，模型和模式设置保持不变。",
+      );
+      return;
+
+    case "cancel": {
+      const cancelled = runner.cancel(target.chatId);
+      await sendText(
+        target,
+        cancelled ? "已请求取消当前任务。" : "当前没有正在执行的 Codex 任务。",
+      );
+      return;
+    }
+
+    case "status":
+    case "cwd": {
+      const status = await runner.getStatus(target.chatId);
+      const queued = status.pending > 1 ? status.pending - 1 : 0;
+      const runtime = status.active
+        ? `运行中${queued > 0 ? `（另有 ${queued} 个任务排队）` : ""}`
+        : queued > 0
+          ? `排队中（${queued}）`
+          : "空闲";
+      await sendMarkdown(
+        target,
+        [
+          `会话：${status.threadId ?? "尚未建立"}`,
+          `模型：${status.model}`,
+          `模式：${status.sandbox}`,
+          `网络：${config.codexNetworkAccess ? "允许" : "禁止"}`,
+          `状态：${runtime}`,
+          `目录：\`${status.workspace}\``,
+          `服务：${hostname()}`,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    case "model": {
+      const status = await runner.getStatus(target.chatId);
+      if (!command.argument) {
+        await sendText(target, `当前模型：${status.model}`);
+        return;
+      }
+
+      if (command.argument.toLowerCase() === "default") {
+        await runner.setModel(target.chatId, undefined);
+        const updated = await runner.getStatus(target.chatId);
+        await sendText(target, `已恢复默认模型：${updated.model}`);
+        return;
+      }
+
+      if (!/^[a-zA-Z0-9._:/-]{1,100}$/.test(command.argument)) {
+        await sendText(target, "模型名称格式无效。");
+        return;
+      }
+
+      await runner.setModel(target.chatId, command.argument);
+      await sendText(target, `当前模型已切换为：${command.argument}`);
+      return;
+    }
+
+    case "mode":
+    case "sandbox": {
+      const status = await runner.getStatus(target.chatId);
+      if (!command.argument) {
+        await sendText(target, `当前模式：${status.sandbox}`);
+        return;
+      }
+
+      if (command.argument.toLowerCase() === "default") {
+        await runner.setSandbox(target.chatId, undefined);
+        const updated = await runner.getStatus(target.chatId);
+        await sendText(target, `已恢复默认模式：${updated.sandbox}`);
+        return;
+      }
+
+      if (!isSupportedSandbox(command.argument)) {
+        await sendText(
+          target,
+          "模式仅支持 `read-only` 或 `workspace-write`。",
+        );
+        return;
+      }
+
+      await runner.setSandbox(target.chatId, command.argument);
+      await sendText(target, `当前模式已切换为：${command.argument}`);
+      return;
+    }
+
+    case "files": {
+      const workspace = workspaceForChat(config.workspaceRoot, target.chatId);
+      try {
+        const listing = await listWorkspaceFiles(
+          config.workspaceRoot,
+          workspace,
+          command.argument,
+        );
+        await sendMarkdown(target, listing);
+      } catch (error) {
+        await sendText(
+          target,
+          error instanceof Error ? error.message : "读取目录失败。",
+        );
+      }
+      return;
+    }
+
+    case "git":
+    case "diff": {
+      const workspace = workspaceForChat(config.workspaceRoot, target.chatId);
+      const operation =
+        command.name === "diff" ? "diff" : command.argument.toLowerCase() || "status";
+      try {
+        const output = await runWorkspaceGit(workspace, operation);
+        await sendMarkdown(
+          target,
+          `\`git ${markdownCode(operation)}\`\n\n\`\`\`text\n${truncateText(output, 12000)}\n\`\`\``,
+        );
+      } catch (error) {
+        await sendText(
+          target,
+          error instanceof Error ? error.message : "Git 命令执行失败。",
+        );
+      }
+      return;
+    }
+
+    case "review": {
+      const extra = command.argument
+        ? `\nAdditional review instructions: ${command.argument}`
+        : "";
+      const reviewPrompt = [
+        "Review the current workspace changes and repository state.",
+        "Findings first, ordered by severity. Focus on bugs, regressions, security risks, and missing tests.",
+        "Inspect the diff and relevant surrounding code. Do not modify files.",
+        extra,
+      ].join("\n");
+      await executePrompt(target, reviewPrompt);
+      return;
+    }
+
+    default:
+      await sendText(
+        target,
+        `未知命令：/${command.name}\n发送 /help 查看可用命令。`,
+      );
+  }
+}
 
 channel.on({
   message: async (message) => {
     const prompt = message.content.trim();
+    const target: ReplyTarget = {
+      chatId: message.chatId,
+      messageId: message.messageId,
+      ...(message.threadId ? { threadId: message.threadId } : {}),
+    };
+
     if (!prompt) {
-      await channel.send(message.chatId, { text: "请输入要交给 Codex 的任务。" }, {
-        replyTo: message.messageId,
-      });
+      await sendText(target, "请输入要交给 Codex 的任务。");
       return;
     }
 
-    if (isHelpCommand(prompt)) {
-      await channel.send(message.chatId, { markdown: helpText }, {
-        replyTo: message.messageId,
-      });
-      return;
-    }
-
-    if (isNewCommand(prompt)) {
-      await runner.reset(message.chatId);
-      await channel.send(message.chatId, { text: "已清空当前 Codex 会话。" }, {
-        replyTo: message.messageId,
-      });
-      return;
-    }
-
-    if (isStatusCommand(prompt)) {
-      const threadId = await runner.getThreadId(message.chatId);
-      const workspace = workspaceForChat(config.workspaceRoot, message.chatId);
-      const status = [
-        `会话：${threadId ?? "尚未建立"}`,
-        `模型：${config.codexModel ?? "Codex 默认配置"}`,
-        `目录：${workspace}`,
-        `沙箱：${config.codexSandbox}`,
-        `网络：${config.codexNetworkAccess ? "允许" : "禁止"}`,
-      ].join("\n");
-      await channel.send(message.chatId, { markdown: status }, {
-        replyTo: message.messageId,
-      });
+    const command = parseSlashCommand(prompt);
+    if (command) {
+      await handleCommand(target, command);
       return;
     }
 
     if (prompt.length > config.maxPromptChars) {
-      await channel.send(
-        message.chatId,
-        {
-          text: `消息过长，当前上限为 ${config.maxPromptChars} 个字符。`,
-        },
-        { replyTo: message.messageId },
+      await sendText(
+        target,
+        `消息过长，当前上限为 ${config.maxPromptChars} 个字符。`,
       );
       return;
     }
 
-    await channel.send(
-      message.chatId,
-      { text: "Codex 已收到任务，正在处理..." },
-      { replyTo: message.messageId },
-    );
-
-    try {
-      const result = await runner.run(message.chatId, prompt);
-      const responseText =
-        result.finalResponse.trim() || "Codex 没有返回文本结果。";
-      await channel.send(
-        message.chatId,
-        { markdown: truncateText(responseText, 100000) },
-        {
-          replyTo: message.messageId,
-          replyInThread: Boolean(message.threadId),
-        },
-      );
-      log("run.completed", {
-        chatId: message.chatId,
-        threadId: result.threadId,
-      });
-    } catch (error) {
-      const messageText =
-        error instanceof Error ? error.message : String(error);
-      const errorId = randomUUID();
-      await channel.send(
-        message.chatId,
-        {
-          text: `Codex 执行失败。请将错误编号提供给管理员：${errorId}`,
-        },
-        { replyTo: message.messageId },
-      );
-      log("run.failed", {
-        errorId,
-        chatId: message.chatId,
-        error: messageText,
-      });
-    }
+    await executePrompt(target, prompt);
   },
   reject: (event) => {
     log("message.rejected", {
@@ -241,6 +442,10 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   ready = false;
   log("shutdown.started", { signal });
+  const cancelled = runner.cancelAll();
+  if (cancelled > 0) {
+    log("shutdown.runs_cancelled", { count: cancelled });
+  }
   await channel.disconnect().catch((error: unknown) => {
     log("shutdown.channel_error", {
       error: error instanceof Error ? error.message : String(error),

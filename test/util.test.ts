@@ -4,6 +4,7 @@ import {
   isHelpCommand,
   isNewCommand,
   isStatusCommand,
+  parseSlashCommand,
   safeDirectoryName,
   truncateText,
 } from "../src/util.js";
@@ -20,9 +21,20 @@ test("truncateText reports omitted characters", () => {
 });
 
 test("slash commands are exact commands", () => {
+  assert.deepEqual(parseSlashCommand("/model gpt-5.5"), {
+    name: "model",
+    argument: "gpt-5.5",
+  });
+  assert.deepEqual(parseSlashCommand("  /git   status  "), {
+    name: "git",
+    argument: "status",
+  });
+  assert.equal(parseSlashCommand("hello"), undefined);
   assert.equal(isNewCommand("/new"), true);
   assert.equal(isNewCommand("/new chat"), true);
+  assert.equal(isNewCommand("/clear"), true);
   assert.equal(isNewCommand("/newer"), false);
   assert.equal(isHelpCommand("/help"), true);
   assert.equal(isStatusCommand("/status now"), true);
+  assert.equal(isStatusCommand("/cwd"), true);
 });

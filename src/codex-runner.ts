@@ -19,26 +19,49 @@ export interface RunOutput {
   workspace: string;
 }
 
+export interface ChatRunStatus {
+  threadId?: string;
+  model: string;
+  sandbox: SupportedSandbox;
+  workspace: string;
+  active: boolean;
+  pending: number;
+}
+
+interface RunSettings {
+  model?: string;
+  sandbox: SupportedSandbox;
+}
+
+export class RunCancelledError extends Error {
+  constructor() {
+    super("Codex run cancelled.");
+    this.name = "RunCancelledError";
+  }
+}
+
 export class CodexRunner {
   private readonly codex = new Codex();
   private readonly store: SessionStore;
   private readonly workspaceRoot: string;
-  private readonly sandbox: SupportedSandbox;
+  private readonly defaultSandbox: SupportedSandbox;
   private readonly networkAccess: boolean;
-  private readonly model?: string;
+  private readonly defaultModel?: string;
   private readonly maxConcurrentRuns: number;
   private activeRuns = 0;
   private readonly waiters: Array<() => void> = [];
   private readonly chatQueues = new Map<string, Promise<void>>();
+  private readonly activeControllers = new Map<string, AbortController>();
+  private readonly pendingRuns = new Map<string, number>();
 
   constructor(options: CodexRunnerOptions) {
     this.workspaceRoot = options.workspaceRoot;
     this.store = new SessionStore(options.sessionsFile);
-    this.sandbox = options.sandbox;
+    this.defaultSandbox = options.sandbox;
     this.networkAccess = options.networkAccess;
     this.maxConcurrentRuns = options.maxConcurrentRuns;
     if (options.model) {
-      this.model = options.model;
+      this.defaultModel = options.model;
     }
   }
 
@@ -46,33 +69,86 @@ export class CodexRunner {
     return (await this.store.get(chatId))?.threadId;
   }
 
+  async getStatus(chatId: string): Promise<ChatRunStatus> {
+    const record = await this.store.get(chatId);
+    const settings = this.resolveSettings(record);
+    return {
+      ...(record?.threadId ? { threadId: record.threadId } : {}),
+      model: settings.model ?? "Codex 默认配置",
+      sandbox: settings.sandbox,
+      workspace: workspaceForChat(this.workspaceRoot, chatId),
+      active: this.activeControllers.has(chatId),
+      pending: this.pendingRuns.get(chatId) ?? 0,
+    };
+  }
+
   async reset(chatId: string): Promise<void> {
-    await this.store.delete(chatId);
+    await this.store.resetThread(chatId);
+  }
+
+  async setModel(chatId: string, model: string | undefined): Promise<void> {
+    await this.store.setModel(chatId, model);
+  }
+
+  async setSandbox(
+    chatId: string,
+    sandbox: SupportedSandbox | undefined,
+  ): Promise<void> {
+    await this.store.setSandbox(chatId, sandbox);
+  }
+
+  cancel(chatId: string): boolean {
+    const controller = this.activeControllers.get(chatId);
+    if (!controller) {
+      return false;
+    }
+
+    controller.abort();
+    return true;
+  }
+
+  cancelAll(): number {
+    const controllers = [...this.activeControllers.values()];
+    for (const controller of controllers) {
+      controller.abort();
+    }
+    return controllers.length;
   }
 
   async run(chatId: string, prompt: string): Promise<RunOutput> {
+    this.pendingRuns.set(chatId, (this.pendingRuns.get(chatId) ?? 0) + 1);
+
     return this.enqueueForChat(chatId, async () => {
+      const controller = new AbortController();
+      this.activeControllers.set(chatId, controller);
       await this.acquireRunSlot();
+
       try {
         const workspace = workspaceForChat(this.workspaceRoot, chatId);
         await mkdir(workspace, { recursive: true });
 
-        const existingThreadId = await this.store.get(chatId);
-        let thread = this.createThread(existingThreadId?.threadId, workspace);
+        const record = await this.store.get(chatId);
+        const settings = this.resolveSettings(record);
+        let thread = this.createThread(record?.threadId, workspace, settings);
 
         let result;
         try {
-          result = await thread.run(prompt);
+          result = await thread.run(prompt, { signal: controller.signal });
         } catch (error) {
-          if (
-            !existingThreadId?.threadId ||
-            !this.isMissingThreadError(error)
-          ) {
+          if (controller.signal.aborted) {
+            throw new RunCancelledError();
+          }
+
+          if (!record?.threadId || !this.isMissingThreadError(error)) {
             throw error;
           }
 
-          thread = this.createThread(undefined, workspace);
-          result = await thread.run(prompt);
+          thread = this.createThread(undefined, workspace, settings);
+          result = await thread.run(prompt, { signal: controller.signal });
+        }
+
+        if (controller.signal.aborted) {
+          throw new RunCancelledError();
         }
 
         if (thread.id) {
@@ -81,16 +157,32 @@ export class CodexRunner {
 
         return {
           finalResponse: result.finalResponse,
-          threadId: thread.id ?? existingThreadId?.threadId ?? "",
+          threadId: thread.id ?? record?.threadId ?? "",
           workspace,
         };
       } finally {
+        this.activeControllers.delete(chatId);
         this.releaseRunSlot();
+        this.decrementPending(chatId);
       }
     });
   }
 
-  private createThread(threadId: string | undefined, workspace: string): Thread {
+  private resolveSettings(
+    record: Awaited<ReturnType<SessionStore["get"]>>,
+  ): RunSettings {
+    const model = record?.model ?? this.defaultModel;
+    return {
+      ...(model ? { model } : {}),
+      sandbox: record?.sandbox ?? this.defaultSandbox,
+    };
+  }
+
+  private createThread(
+    threadId: string | undefined,
+    workspace: string,
+    settings: RunSettings,
+  ): Thread {
     const common: {
       sandboxMode: SupportedSandbox;
       workingDirectory: string;
@@ -101,7 +193,7 @@ export class CodexRunner {
       modelReasoningEffort?: ModelReasoningEffort;
       model?: string;
     } = {
-      sandboxMode: this.sandbox,
+      sandboxMode: settings.sandbox,
       workingDirectory: workspace,
       skipGitRepoCheck: true,
       networkAccessEnabled: this.networkAccess,
@@ -109,8 +201,8 @@ export class CodexRunner {
       threadSource: "feishu-codex-agent",
     };
 
-    if (this.model) {
-      common.model = this.model;
+    if (settings.model) {
+      common.model = settings.model;
     }
 
     return threadId
@@ -129,6 +221,15 @@ export class CodexRunner {
       ),
     );
     return next;
+  }
+
+  private decrementPending(chatId: string): void {
+    const next = (this.pendingRuns.get(chatId) ?? 1) - 1;
+    if (next > 0) {
+      this.pendingRuns.set(chatId, next);
+    } else {
+      this.pendingRuns.delete(chatId);
+    }
   }
 
   private async acquireRunSlot(): Promise<void> {

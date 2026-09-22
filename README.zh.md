@@ -1,119 +1,111 @@
 # 飞书远程 Codex 助手
 
-这个项目把飞书自建应用机器人连接到运行在云端的 Codex。服务通过飞书 WebSocket 长连接接收消息，不需要公网回调地址，也不依赖个人电脑常开。
+这个项目是独立的飞书机器人服务，通过飞书 WebSocket 长连接接收消息，并调用同一项目内的 Codex SDK 和 Codex CLI 完成任务。运行时不依赖 Codex 桌面应用、VSCode 插件、Docker 或 systemd。
 
-架构：
-
-```text
-飞书用户 -> 飞书机器人 -> 飞书 WebSocket -> 远程 Node.js 服务
-                                                   |
-                                                   +-> Codex SDK / Codex CLI
-                                                   +-> /data 持久化工作区和会话
-```
-
-## 1. 创建飞书应用
-
-需要 Node.js 20.12 或更高版本。
-
-```bash
-npm install
-npm run setup
-```
-
-终端会输出一个飞书授权链接。用飞书打开该链接，确认创建应用。脚本会自动申请：
-
-- 机器人能力
-- `im.message.receive_v1` 接收消息事件
-- `im:message.p2p_msg:readonly`
-- `im:message.group_at_msg:readonly`
-- `im:message:send_as_bot`
-
-成功后，App ID、App Secret 和应用创建者的 Open ID 会写入 `.env.lark`。该文件已经被 `.gitignore` 忽略。
-
-创建后，在飞书开放平台检查应用版本和可用范围。企业环境通常还需要管理员审核并发布版本。
-
-## 2. 配置远程运行
-
-推荐使用一台长期在线的 Linux 云主机，例如 1 vCPU、2 GB 内存起步，并挂载持久化磁盘。飞书长连接需要常驻进程，不适合普通短生命周期 Serverless 函数。
-
-复制示例配置：
-
-```bash
-cp .env.example .env
-```
-
-至少填写：
-
-```dotenv
-CODEX_ACCESS_TOKEN=...
-CODEX_MODEL=gpt-5.5
-```
-
-Codex 访问令牌适合在远程无人值守环境中认证。官方文档说明，个人访问令牌目前面向 ChatGPT Business 和 Enterprise 工作区；服务账号适合组织级自动化。没有这类令牌时，可以在远程 Codex home 目录中完成一次交互式登录，再持久化 `/home/node/.codex`。
-
-`CODEX_MODEL` 会作为每次运行的显式模型参数传给 Codex，因此不会随 Codex 应用里的当前对话设置或全局默认模型变化。
-
-## 3. 启动服务
-
-安装 Docker 和 Compose 后，在项目目录执行：
-
-```bash
-docker compose up -d --build
-docker compose logs -f
-```
-
-健康检查：
-
-```bash
-curl http://127.0.0.1:3000/readyz
-```
-
-机器人连上飞书后，创建者可以直接私聊机器人。群聊默认关闭，以防机器人被加入群后对所有群消息执行任务。
-
-## 4. 开放群聊
-
-先把机器人加入群，并发送一条 `@机器人 /help`。未授权群会被安全策略静默拒绝，日志中会记录 `chatId`：
-
-```bash
-docker compose logs | grep message.rejected
-```
-
-把目标群 ID 写入 `.env`：
-
-```dotenv
-FEISHU_ALLOWED_CHAT_IDS=oc_xxx,oc_yyy
-```
-
-重启服务：
-
-```bash
-docker compose restart agent
-```
-
-群聊中必须 `@机器人`。`@所有人` 不会触发执行。
-
-## 使用方式
-
-- 私聊：直接发送任务。
-- 群聊：`@机器人 任务描述`。
-- `/new`：清空当前聊天对应的 Codex 会话。
-- `/status`：查看会话、工作目录、沙箱和网络状态。
-- `/help`：查看帮助。
-
-每个飞书聊天使用独立的 Codex thread 和工作目录。会话索引与工作区分别保存在 Docker 卷 `agent-data` 和 `codex-home` 中。
-
-## NAS 原生部署
-
-如果远程 Linux 主机长期在线但没有 Docker，可以直接把项目放在 NAS 挂载目录中运行。推荐目录：
+默认 NAS 项目根目录：
 
 ```text
-/workspace/nas-data/apps/feishu-codex-agent
+/workspace/nas-data/Feishu-Codex-Agent
 ```
 
-首次部署：
+## 数据流
+
+```mermaid
+sequenceDiagram
+    participant U as 飞书用户
+    participant F as 飞书开放平台
+    participant S as NAS Node.js 服务
+    participant R as CodexRunner
+    participant C as Codex CLI
+    participant M as Codex 模型
+    participant W as 聊天 workspace
+
+    U->>F: 发送消息
+    F-->>S: WebSocket 推送消息事件
+    S->>S: 校验身份、去重、识别斜杠命令
+    alt 控制命令
+        S->>S: 读取会话、模型、模式或 Git 信息
+        S-->>F: 直接返回命令结果
+    else 普通任务或 /review
+        S->>R: run(chatId, prompt)
+        R->>R: 按聊天串行排队并恢复 Codex thread
+        R->>C: 启动项目内 CLI 和 AbortSignal
+        C->>M: 发送用户提示、上下文和工具定义
+        M-->>C: 返回文本或工具调用
+        C->>W: 在沙箱内读取或修改文件
+        C-->>R: 返回 finalResponse
+        R-->>S: 返回最终文本和 threadId
+        S-->>F: 调用消息发送 API
+    end
+    F-->>U: 显示结果
+```
+
+具体数据流：
+
+1. 用户在飞书私聊直接发消息，或在已授权群里 `@机器人` 发消息。
+2. 飞书通过 WebSocket 把消息事件推给 NAS 上的 Node.js 服务，不需要公网回调地址。
+3. 服务执行私聊/群聊 allowlist、消息去重、长度检查和斜杠命令识别。
+4. `/new`、`/status`、`/model`、`/mode`、`/files`、`/git`、`/cancel` 等命令由服务直接处理。
+5. 普通文本和 `/review` 进入 `CodexRunner`。同一个飞书聊天严格串行，不同聊天可以并发。
+6. `CodexRunner` 为每个聊天保存独立的 Codex `threadId` 和 workspace，并恢复上一次会话。
+7. Codex SDK 启动项目内 `node_modules/@openai/codex`，使用项目的 `.codex-home` 作为 `CODEX_HOME`。
+8. Codex CLI 将提示和工具定义发送给配置的模型与 provider，当前默认是 `gpt-5.5` 和 `huya`。
+9. 模型产生的命令、文件修改等工具调用由 Codex CLI 执行。默认 `workspace-write` 沙箱、审批 `never`、网络关闭。
+10. 工具结果会继续送回模型，直到模型产生最终回答。
+11. 服务把最终文本通过飞书发送 API 返回给用户。文件、会话和日志都保存在 NAS 项目目录内。
+
+## 飞书命令
+
+### 会话
+
+- `/new`：清空当前 Codex thread，保留模型和模式设置。也支持 `/reset`、`/clear`。
+- `/status`：查看会话、模型、沙箱、网络、目录、运行状态和服务主机。也支持 `/cwd`。
+- `/cancel`：通过 `AbortSignal` 取消当前正在执行的 Codex 任务。
+- `/help`：显示完整帮助。
+
+### 开发
+
+- `/files [路径]`：最多列出当前聊天 workspace 内的 200 个文件或目录。
+- `/git status`：查看当前 workspace 的 Git 分支和文件状态。
+- `/git log`：查看最近 10 条提交。
+- `/git diff`：查看未暂存变更统计。也支持 `/diff`。
+- `/review [额外要求]`：让 Codex 以代码审查模式检查当前 workspace，默认只审查、不修改。
+
+### 配置
+
+- `/model`：查看当前模型。
+- `/model gpt-5.5`：为当前飞书聊天切换模型。
+- `/model default`：恢复服务配置中的默认模型。
+- `/mode`：查看当前沙箱模式。
+- `/mode read-only`：只读模式，适合分析和审查。
+- `/mode workspace-write`：允许修改当前 workspace，适合正常开发。
+- `/mode default`：恢复服务配置中的默认模式。
+
+模型和模式设置按飞书聊天独立保存。普通 `/new` 不会清除这两个设置。
+
+## NAS 部署
+
+项目根目录同时保存源码、Git 工作区、依赖和运行数据：
+
+```text
+/workspace/nas-data/Feishu-Codex-Agent
+├── .git/
+├── .codex-home/       # Codex 登录态和配置，Git 忽略
+├── data/              # 会话索引等，Git 忽略
+├── logs/              # 服务日志，Git 忽略
+├── node_modules/      # npm 依赖，Git 忽略
+├── run/               # PID 文件，Git 忽略
+├── scripts/
+├── src/
+├── workspaces/        # 每个飞书聊天的独立工作目录，Git 忽略
+├── .env               # 服务配置，Git 忽略
+└── .env.lark          # 飞书凭据，Git 忽略
+```
+
+首次安装和编译：
 
 ```bash
-cd /workspace/nas-data/apps/feishu-codex-agent
+cd /workspace/nas-data/Feishu-Codex-Agent
 npm ci
 npm run build
 mkdir -p .codex-home data logs run workspaces
@@ -130,20 +122,27 @@ bash scripts/service.sh status
 bash scripts/service.sh logs
 ```
 
-脚本会设置 `CODEX_HOME=.codex-home`、`DATA_DIR=data` 和 `WORKSPACE_ROOT=workspaces`，所有运行数据都留在项目目录内。`.codex-home/auth.json`、`.env` 和 `.env.lark` 已被 Git 忽略，不会提交。
+服务脚本会设置：
 
-这个模式不依赖 systemd，因此远程主机重启后需要执行一次 `bash scripts/service.sh start`。在主机持续在线的前提下，飞书机器人不依赖本机 Codex 应用是否打开。
+```text
+CODEX_HOME=<project>/.codex-home
+DATA_DIR=<project>/data
+WORKSPACE_ROOT=<project>/workspaces
+```
+
+这个模式不依赖 systemd。远程主机重启后需要执行一次 `bash scripts/service.sh start`。主机持续在线时，飞书机器人不依赖本机 Codex 应用是否打开。
 
 同一个飞书应用只能运行一个长连接服务实例。部署到 NAS 后，必须停止本机或其他机器上的同应用实例，避免飞书事件被多个客户端分流。
 
-## Git 仓库与更新
+## Git 工作流
 
-NAS 上的长期目录约定：
+NAS 项目目录本身就是 Git 工作区，已配置：
 
-```text
-/workspace/nas-data/git/feishu-codex-agent.git   # 裸仓库，主版本
-/workspace/nas-data/apps/feishu-codex-agent      # 运行中的部署目录
+```bash
+git config receive.denyCurrentBranch updateInstead
 ```
+
+因此开发机可以推送到一个干净的项目根目录，Git 会同步更新工作树。
 
 开发机推送：
 
@@ -151,11 +150,10 @@ NAS 上的长期目录约定：
 git push nas main
 ```
 
-NAS 拉取并重启：
+NAS 更新依赖、编译并重启：
 
 ```bash
-cd /workspace/nas-data/apps/feishu-codex-agent
-git pull --ff-only
+cd /workspace/nas-data/Feishu-Codex-Agent
 npm ci
 npm run build
 bash scripts/service.sh restart
@@ -163,20 +161,75 @@ bash scripts/service.sh restart
 
 本机 Git 使用系统 OpenSSH 与 `notebook` 主机别名连接 NAS。密钥带口令时，推送前需确保 Windows `ssh-agent` 已加载对应密钥。
 
+## 首次创建飞书应用
+
+需要 Node.js 20.12 或更高版本。
+
+```bash
+npm install
+npm run setup
+```
+
+终端会输出飞书授权链接。脚本会自动申请：
+
+- 机器人能力
+- `im.message.receive_v1`
+- `im:message.p2p_msg:readonly`
+- `im:message.group_at_msg:readonly`
+- `im:message:send_as_bot`
+
+App ID、App Secret 和应用创建者的 Open ID 会写入 `.env.lark`。企业环境还需要在飞书开放平台发布版本并确认可用范围。
+
+## 群聊授权
+
+先把机器人加入群，并发送一条 `@机器人 /help`。未授权群会被安全策略静默拒绝，日志中会记录 `chatId`：
+
+```bash
+grep message.rejected logs/feishu-codex-agent.log
+```
+
+把目标群 ID 写入 `.env`：
+
+```dotenv
+FEISHU_ALLOWED_CHAT_IDS=oc_xxx,oc_yyy
+```
+
+重启：
+
+```bash
+bash scripts/service.sh restart
+```
+
+## 配置
+
+常用 `.env` 配置：
+
+```dotenv
+CODEX_MODEL=gpt-5.5
+CODEX_SANDBOX=workspace-write
+CODEX_NETWORK_ACCESS=false
+FEISHU_ALLOWED_CHAT_IDS=
+MAX_CONCURRENT_RUNS=2
+MAX_PROMPT_CHARS=12000
+PORT=3000
+```
+
+`CODEX_MODEL` 会作为每次运行的显式模型参数传给 Codex，因此不会随 Codex 应用的当前对话设置或全局默认模型变化。
+
 ## 安全边界
 
-默认配置使用：
+默认使用：
 
 - Codex 沙箱：`workspace-write`
 - Codex 网络：关闭
-- 私聊：仅应用创建者和 `FEISHU_ALLOWED_OPEN_IDS` 中的用户
-- 群聊：默认禁用，只响应 `FEISHU_ALLOWED_CHAT_IDS` 中的群
 - Codex 审批：`never`
+- 私聊：仅应用创建者和 `FEISHU_ALLOWED_OPEN_IDS`
+- 群聊：默认禁用，只响应 `FEISHU_ALLOWED_CHAT_IDS`
 
-不要改成 `danger-full-access`，除非远程服务器是专用、隔离且可随时销毁的环境。不要把 `CODEX_ACCESS_TOKEN`、`.env` 或 `.env.lark` 提交到 Git。
+不要改成 `danger-full-access`，除非远程服务器是专用、隔离且可随时销毁的环境。不要提交 `.env`、`.env.lark` 或 `.codex-home/auth.json`。
 
-## 运维限制
+## 当前限制
 
-飞书长连接采用集群投递模式，同一个事件只会发给一个客户端。因此这个服务应当只运行一个副本。需要扩容时，应先在应用层增加分布式队列，再拆分飞书接收和 Codex 执行服务。
-
-当前版本支持文本任务和最终结果卡片，不支持语音输入、图片附件、按钮审批或运行中取消。
+- 只处理文本任务，不处理语音和图片附件。
+- `/cancel` 只取消当前运行任务，已经在同一聊天排队的后续任务仍会继续。
+- 飞书长连接只支持单服务副本。扩容前需要增加分布式队列并拆分接收与执行服务。

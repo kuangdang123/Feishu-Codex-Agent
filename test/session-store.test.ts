@@ -11,6 +11,7 @@ test("session settings survive thread reset", async () => {
     const store = new SessionStore(path.join(directory, "sessions.json"));
     await store.setModel("chat-1", "gpt-5.5");
     await store.setSandbox("chat-1", "read-only");
+    await store.setNetworkAccess("chat-1", true);
     await store.setThreadId("chat-1", "thread-1");
     await store.resetThread("chat-1");
 
@@ -18,6 +19,7 @@ test("session settings survive thread reset", async () => {
     assert.equal(record?.threadId, undefined);
     assert.equal(record?.model, "gpt-5.5");
     assert.equal(record?.sandbox, "read-only");
+    assert.equal(record?.networkAccess, true);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -1,7 +1,13 @@
 import path from "node:path";
 import process from "node:process";
 
-export type SupportedSandbox = "read-only" | "workspace-write";
+export const SUPPORTED_SANDBOXES = [
+  "read-only",
+  "workspace-write",
+  "danger-full-access",
+] as const;
+
+export type SupportedSandbox = (typeof SUPPORTED_SANDBOXES)[number];
 
 export interface AppConfig {
   larkAppId: string;
@@ -66,11 +72,17 @@ function parsePositiveInteger(
 
 function parseSandbox(value: string | undefined): SupportedSandbox {
   const sandbox = value ?? "workspace-write";
-  if (sandbox === "read-only" || sandbox === "workspace-write") {
+  if (isSupportedSandbox(sandbox)) {
     return sandbox;
   }
 
-  throw new Error("CODEX_SANDBOX must be read-only or workspace-write.");
+  throw new Error(
+    "CODEX_SANDBOX must be read-only, workspace-write, or danger-full-access.",
+  );
+}
+
+export function isSupportedSandbox(value: string): value is SupportedSandbox {
+  return (SUPPORTED_SANDBOXES as readonly string[]).includes(value);
 }
 
 function requireValue(value: string | undefined, name: string): string {

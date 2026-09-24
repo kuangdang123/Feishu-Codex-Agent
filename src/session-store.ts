@@ -1,12 +1,14 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { SupportedSandbox } from "./config.js";
 
-export type SessionSandbox = "read-only" | "workspace-write";
+export type SessionSandbox = SupportedSandbox;
 
 export interface SessionRecord {
   threadId?: string;
   model?: string;
   sandbox?: SessionSandbox;
+  networkAccess?: boolean;
   updatedAt: string;
 }
 
@@ -66,6 +68,22 @@ export class SessionStore {
     await this.write(data);
   }
 
+  async setNetworkAccess(
+    chatId: string,
+    networkAccess: boolean | undefined,
+  ): Promise<void> {
+    const data = await this.read();
+    const record = this.ensureRecord(data, chatId);
+    if (networkAccess === undefined) {
+      delete record.networkAccess;
+    } else {
+      record.networkAccess = networkAccess;
+    }
+    record.updatedAt = new Date().toISOString();
+    this.removeIfEmpty(data, chatId, record);
+    await this.write(data);
+  }
+
   async resetThread(chatId: string): Promise<void> {
     const data = await this.read();
     const record = data.sessions[chatId];
@@ -107,7 +125,12 @@ export class SessionStore {
     chatId: string,
     record: SessionRecord,
   ): void {
-    if (!record.threadId && !record.model && !record.sandbox) {
+    if (
+      !record.threadId &&
+      !record.model &&
+      !record.sandbox &&
+      record.networkAccess === undefined
+    ) {
       delete data.sessions[chatId];
     }
   }

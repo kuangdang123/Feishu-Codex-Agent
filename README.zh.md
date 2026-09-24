@@ -45,7 +45,7 @@ sequenceDiagram
 1. 用户在飞书私聊直接发消息，或在已授权群里 `@机器人` 发消息。
 2. 飞书通过 WebSocket 把消息事件推给 NAS 上的 Node.js 服务，不需要公网回调地址。
 3. 服务执行私聊/群聊 allowlist、消息去重、长度检查和斜杠命令识别。
-4. `/new`、`/status`、`/model`、`/mode`、`/files`、`/git`、`/cancel` 等命令由服务直接处理。
+4. `/new`、`/status`、`/model`、`/mode`、`/network`、`/files`、`/git`、`/cancel` 等命令由服务直接处理。
 5. 普通文本和 `/review` 进入 `CodexRunner`。同一个飞书聊天严格串行，不同聊天可以并发。
 6. `CodexRunner` 为每个聊天保存独立的 Codex `threadId` 和 workspace，并恢复上一次会话。
 7. Codex SDK 启动项目内 `node_modules/@openai/codex`，使用项目的 `.codex-home` 作为 `CODEX_HOME`。
@@ -58,7 +58,7 @@ sequenceDiagram
 
 ### 会话
 
-- `/new`：清空当前 Codex thread，保留模型和模式设置。也支持 `/reset`、`/clear`。
+- `/new`：清空当前 Codex thread，保留模型、模式和网络设置。也支持 `/reset`、`/clear`。
 - `/status`：查看会话、模型、沙箱、网络、目录、运行状态和服务主机。也支持 `/cwd`。
 - `/cancel`：通过 `AbortSignal` 取消当前正在执行的 Codex 任务。
 - `/help`：显示完整帮助。
@@ -79,9 +79,14 @@ sequenceDiagram
 - `/mode`：查看当前沙箱模式。
 - `/mode read-only`：只读模式，适合分析和审查。
 - `/mode workspace-write`：允许修改当前 workspace，适合正常开发。
+- `/mode danger-full-access`：关闭 Codex 沙箱，允许访问整个远程环境。
 - `/mode default`：恢复服务配置中的默认模式。
+- `/network`：查看当前会话的网络权限。
+- `/network on`：允许当前会话内的命令访问网络。
+- `/network off`：禁止当前会话内的命令访问网络。
+- `/network default`：恢复服务配置中的默认网络设置。
 
-模型和模式设置按飞书聊天独立保存。普通 `/new` 不会清除这两个设置。
+模型、沙箱和网络设置按飞书聊天独立保存。普通 `/new` 不会清除这些设置。
 
 ## NAS 部署
 
@@ -216,6 +221,16 @@ PORT=3000
 
 `CODEX_MODEL` 会作为每次运行的显式模型参数传给 Codex，因此不会随 Codex 应用的当前对话设置或全局默认模型变化。
 
+服务默认值也可以在启动时通过环境变量覆盖：
+
+```bash
+CODEX_SANDBOX=danger-full-access \
+CODEX_NETWORK_ACCESS=true \
+bash scripts/service.sh restart
+```
+
+飞书中的 `/mode` 和 `/network` 只影响当前聊天，并优先于服务默认值。
+
 ## 安全边界
 
 默认使用：
@@ -226,7 +241,7 @@ PORT=3000
 - 私聊：仅应用创建者和 `FEISHU_ALLOWED_OPEN_IDS`
 - 群聊：默认禁用，只响应 `FEISHU_ALLOWED_CHAT_IDS`
 
-不要改成 `danger-full-access`，除非远程服务器是专用、隔离且可随时销毁的环境。不要提交 `.env`、`.env.lark` 或 `.codex-home/auth.json`。
+`danger-full-access` 会关闭 Codex 沙箱，并允许远程任务访问当前进程可见的完整文件系统；配合审批 `never` 时，命令会自动执行。只应在专用、隔离且可随时销毁的远程环境中使用。不要提交 `.env`、`.env.lark` 或 `.codex-home/auth.json`。
 
 ## 当前限制
 

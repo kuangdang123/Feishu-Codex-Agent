@@ -23,6 +23,7 @@ export interface ChatRunStatus {
   threadId?: string;
   model: string;
   sandbox: SupportedSandbox;
+  networkAccess: boolean;
   workspace: string;
   active: boolean;
   pending: number;
@@ -31,6 +32,7 @@ export interface ChatRunStatus {
 interface RunSettings {
   model?: string;
   sandbox: SupportedSandbox;
+  networkAccess: boolean;
 }
 
 export class RunCancelledError extends Error {
@@ -45,7 +47,7 @@ export class CodexRunner {
   private readonly store: SessionStore;
   private readonly workspaceRoot: string;
   private readonly defaultSandbox: SupportedSandbox;
-  private readonly networkAccess: boolean;
+  private readonly defaultNetworkAccess: boolean;
   private readonly defaultModel?: string;
   private readonly maxConcurrentRuns: number;
   private activeRuns = 0;
@@ -58,7 +60,7 @@ export class CodexRunner {
     this.workspaceRoot = options.workspaceRoot;
     this.store = new SessionStore(options.sessionsFile);
     this.defaultSandbox = options.sandbox;
-    this.networkAccess = options.networkAccess;
+    this.defaultNetworkAccess = options.networkAccess;
     this.maxConcurrentRuns = options.maxConcurrentRuns;
     if (options.model) {
       this.defaultModel = options.model;
@@ -76,6 +78,7 @@ export class CodexRunner {
       ...(record?.threadId ? { threadId: record.threadId } : {}),
       model: settings.model ?? "Codex 默认配置",
       sandbox: settings.sandbox,
+      networkAccess: settings.networkAccess,
       workspace: workspaceForChat(this.workspaceRoot, chatId),
       active: this.activeControllers.has(chatId),
       pending: this.pendingRuns.get(chatId) ?? 0,
@@ -95,6 +98,13 @@ export class CodexRunner {
     sandbox: SupportedSandbox | undefined,
   ): Promise<void> {
     await this.store.setSandbox(chatId, sandbox);
+  }
+
+  async setNetworkAccess(
+    chatId: string,
+    networkAccess: boolean | undefined,
+  ): Promise<void> {
+    await this.store.setNetworkAccess(chatId, networkAccess);
   }
 
   cancel(chatId: string): boolean {
@@ -175,6 +185,7 @@ export class CodexRunner {
     return {
       ...(model ? { model } : {}),
       sandbox: record?.sandbox ?? this.defaultSandbox,
+      networkAccess: record?.networkAccess ?? this.defaultNetworkAccess,
     };
   }
 
@@ -196,7 +207,7 @@ export class CodexRunner {
       sandboxMode: settings.sandbox,
       workingDirectory: workspace,
       skipGitRepoCheck: true,
-      networkAccessEnabled: this.networkAccess,
+      networkAccessEnabled: settings.networkAccess,
       approvalPolicy: "never",
       threadSource: "feishu-codex-agent",
     };

@@ -7,7 +7,7 @@ import {
   CodexRunner,
   RunCancelledError,
 } from "./codex-runner.js";
-import { loadConfig, type SupportedSandbox } from "./config.js";
+import { isSupportedSandbox, loadConfig } from "./config.js";
 import {
   parseSlashCommand,
   truncateText,
@@ -31,10 +31,6 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
 
 function markdownCode(value: string): string {
   return value.replaceAll("`", "'");
-}
-
-function isSupportedSandbox(value: string): value is SupportedSandbox {
-  return value === "read-only" || value === "workspace-write";
 }
 
 const config = loadConfig();
@@ -127,8 +123,11 @@ const helpText = [
   "- `/model <名称>`：切换当前聊天模型",
   "- `/model default`：恢复服务默认模型",
   "- `/mode`：查看当前沙箱模式",
-  "- `/mode read-only|workspace-write`：切换当前聊天模式",
+  "- `/mode read-only|workspace-write|danger-full-access`：切换当前聊天模式",
   "- `/mode default`：恢复服务默认模式",
+  "- `/network`：查看当前会话网络权限",
+  "- `/network on|off`：切换当前会话网络权限",
+  "- `/network default`：恢复服务默认网络设置",
   "",
   "其他消息会交给远程 Codex。群聊需要先授权，并 @ 机器人。",
 ].join("\n");
@@ -245,7 +244,7 @@ async function handleCommand(
           `会话：${status.threadId ?? "尚未建立"}`,
           `模型：${status.model}`,
           `模式：${status.sandbox}`,
-          `网络：${config.codexNetworkAccess ? "允许" : "禁止"}`,
+          `网络：${status.networkAccess ? "允许" : "禁止"}`,
           `状态：${runtime}`,
           `目录：\`${status.workspace}\``,
           `服务：${hostname()}`,
@@ -293,16 +292,60 @@ async function handleCommand(
         return;
       }
 
-      if (!isSupportedSandbox(command.argument)) {
+      const sandbox =
+        command.argument.toLowerCase() === "full"
+          ? "danger-full-access"
+          : command.argument.toLowerCase();
+      if (!isSupportedSandbox(sandbox)) {
         await sendText(
           target,
-          "模式仅支持 `read-only` 或 `workspace-write`。",
+          "模式仅支持 `read-only`、`workspace-write` 或 `danger-full-access`。",
         );
         return;
       }
 
-      await runner.setSandbox(target.chatId, command.argument);
-      await sendText(target, `当前模式已切换为：${command.argument}`);
+      await runner.setSandbox(target.chatId, sandbox);
+      await sendText(target, `当前模式已切换为：${sandbox}`);
+      return;
+    }
+
+    case "network": {
+      const status = await runner.getStatus(target.chatId);
+      if (!command.argument) {
+        await sendText(
+          target,
+          `当前网络：${status.networkAccess ? "允许" : "禁止"}`,
+        );
+        return;
+      }
+
+      const value = command.argument.toLowerCase();
+      if (value === "default") {
+        await runner.setNetworkAccess(target.chatId, undefined);
+        const updated = await runner.getStatus(target.chatId);
+        await sendText(
+          target,
+          `已恢复默认网络设置：${updated.networkAccess ? "允许" : "禁止"}`,
+        );
+        return;
+      }
+
+      const networkAccess =
+        ["on", "enable", "enabled", "true", "1"].includes(value)
+          ? true
+          : ["off", "disable", "disabled", "false", "0"].includes(value)
+            ? false
+            : undefined;
+      if (networkAccess === undefined) {
+        await sendText(target, "网络设置仅支持 `on`、`off` 或 `default`。");
+        return;
+      }
+
+      await runner.setNetworkAccess(target.chatId, networkAccess);
+      await sendText(
+        target,
+        `当前网络已切换为：${networkAccess ? "允许" : "禁止"}`,
+      );
       return;
     }
 

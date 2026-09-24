@@ -6,6 +6,7 @@ import { createLarkChannel, LoggerLevel } from "@larksuiteoapi/node-sdk";
 import {
   CodexRunner,
   RunCancelledError,
+  type RunProgress,
 } from "./codex-runner.js";
 import { isSupportedSandbox, loadConfig } from "./config.js";
 import {
@@ -129,6 +130,12 @@ const helpText = [
   "- `/network on|off`：切换当前会话网络权限",
   "- `/network default`：恢复服务默认网络设置",
   "",
+  "**多轮对话与进度**",
+  "- 私聊直接连续发送，群聊每条 @ 机器人；同一聊天会自动延续上下文。",
+  "- 不同私聊或群聊是独立会话，各自保存线程和 workspace。",
+  "- `/new` 只清对话上下文，不删除文件和配置。",
+  "- 任务执行中会显示分析、命令、文件和工具调用进度，结束后返回最终结果。",
+  "",
   "其他消息会交给远程 Codex。群聊需要先授权，并 @ 机器人。",
 ].join("\n");
 
@@ -162,11 +169,72 @@ async function executePrompt(
   target: ReplyTarget,
   prompt: string,
 ): Promise<void> {
-  await sendText(target, "Codex 已收到任务，正在处理...");
+  await sendText(target, "Codex 已收到任务，正在分析并执行...");
 
   void (async () => {
+    const startedAt = Date.now();
+    let lastProgressAt = 0;
+    let lastProgressKey = "";
+    let lastVisibleAt = Date.now();
+    let progressCount = 0;
+    let progressChain = Promise.resolve();
+
+    const sendProgress = (
+      message: string,
+      key: string,
+      force = false,
+    ): void => {
+      const now = Date.now();
+      if (
+        !force &&
+        (key === lastProgressKey || now - lastProgressAt < 2500)
+      ) {
+        return;
+      }
+      if (!force && progressCount >= 40) {
+        return;
+      }
+
+      lastProgressAt = now;
+      lastVisibleAt = now;
+      lastProgressKey = key;
+      progressCount += 1;
+      progressChain = progressChain
+        .catch(() => undefined)
+        .then(() => sendText(target, message))
+        .catch((error: unknown) => {
+          log("run.progress_failed", {
+            chatId: target.chatId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    };
+
+    const reportProgress = (progress: RunProgress): void => {
+      sendProgress(progress.message, `${progress.kind}:${progress.message}`);
+    };
+
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastVisibleAt < 30000) {
+        return;
+      }
+
+      const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+      sendProgress(
+        `Codex 仍在处理，已运行约 ${elapsedSeconds} 秒。完成或失败后会继续通知。`,
+        "heartbeat",
+        true,
+      );
+    }, 5000);
+
     try {
-      const result = await runner.run(target.chatId, prompt);
+      const result = await runner.run(
+        target.chatId,
+        prompt,
+        reportProgress,
+      );
+      clearInterval(heartbeat);
+      await progressChain;
       const responseText =
         result.finalResponse.trim() || "Codex 没有返回文本结果。";
       await sendMarkdown(
@@ -178,6 +246,8 @@ async function executePrompt(
         threadId: result.threadId,
       });
     } catch (error) {
+      clearInterval(heartbeat);
+      await progressChain;
       if (error instanceof RunCancelledError) {
         await sendText(target, "当前 Codex 任务已取消。");
         log("run.cancelled", { chatId: target.chatId });
@@ -216,7 +286,7 @@ async function handleCommand(
       await runner.reset(target.chatId);
       await sendText(
         target,
-        "已开启新的 Codex 会话，模型和模式设置保持不变。",
+        "已开启新的 Codex 会话，模型、模式和网络设置保持不变。",
       );
       return;
 

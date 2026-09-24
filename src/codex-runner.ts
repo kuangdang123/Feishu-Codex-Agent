@@ -1,5 +1,10 @@
 import { mkdir } from "node:fs/promises";
-import { Codex, type ModelReasoningEffort, type Thread } from "@openai/codex-sdk";
+import {
+  Codex,
+  type ModelReasoningEffort,
+  type Thread,
+  type ThreadItem,
+} from "@openai/codex-sdk";
 import type { SupportedSandbox } from "./config.js";
 import { SessionStore } from "./session-store.js";
 import { workspaceForChat } from "./util.js";
@@ -28,6 +33,22 @@ export interface ChatRunStatus {
   active: boolean;
   pending: number;
 }
+
+export type RunProgressKind =
+  | "analysis"
+  | "command"
+  | "file"
+  | "tool"
+  | "search"
+  | "plan"
+  | "error";
+
+export interface RunProgress {
+  kind: RunProgressKind;
+  message: string;
+}
+
+export type RunProgressHandler = (progress: RunProgress) => void;
 
 interface RunSettings {
   model?: string;
@@ -125,7 +146,11 @@ export class CodexRunner {
     return controllers.length;
   }
 
-  async run(chatId: string, prompt: string): Promise<RunOutput> {
+  async run(
+    chatId: string,
+    prompt: string,
+    onProgress?: RunProgressHandler,
+  ): Promise<RunOutput> {
     this.pendingRuns.set(chatId, (this.pendingRuns.get(chatId) ?? 0) + 1);
 
     return this.enqueueForChat(chatId, async () => {
@@ -141,9 +166,14 @@ export class CodexRunner {
         const settings = this.resolveSettings(record);
         let thread = this.createThread(record?.threadId, workspace, settings);
 
-        let result;
+        let finalResponse: string;
         try {
-          result = await thread.run(prompt, { signal: controller.signal });
+          finalResponse = await this.runStreamed(
+            thread,
+            prompt,
+            controller.signal,
+            onProgress,
+          );
         } catch (error) {
           if (controller.signal.aborted) {
             throw new RunCancelledError();
@@ -154,7 +184,12 @@ export class CodexRunner {
           }
 
           thread = this.createThread(undefined, workspace, settings);
-          result = await thread.run(prompt, { signal: controller.signal });
+          finalResponse = await this.runStreamed(
+            thread,
+            prompt,
+            controller.signal,
+            onProgress,
+          );
         }
 
         if (controller.signal.aborted) {
@@ -166,7 +201,7 @@ export class CodexRunner {
         }
 
         return {
-          finalResponse: result.finalResponse,
+          finalResponse,
           threadId: thread.id ?? record?.threadId ?? "",
           workspace,
         };
@@ -221,6 +256,144 @@ export class CodexRunner {
       : this.codex.startThread(common);
   }
 
+  private async runStreamed(
+    thread: Thread,
+    prompt: string,
+    signal: AbortSignal,
+    onProgress?: RunProgressHandler,
+  ): Promise<string> {
+    const { events } = await thread.runStreamed(prompt, { signal });
+    let finalResponse = "";
+
+    for await (const event of events) {
+      if (
+        event.type === "item.started" ||
+        event.type === "item.updated" ||
+        event.type === "item.completed"
+      ) {
+        this.notifyProgress(event.item, event.type, onProgress);
+        if (
+          event.type === "item.completed" &&
+          event.item.type === "agent_message"
+        ) {
+          finalResponse = event.item.text;
+        }
+        continue;
+      }
+
+      if (event.type === "turn.failed") {
+        throw new Error(event.error.message);
+      }
+
+      if (event.type === "error") {
+        throw new Error(event.message);
+      }
+    }
+
+    return finalResponse;
+  }
+
+  private notifyProgress(
+    item: ThreadItem,
+    eventType: "item.started" | "item.updated" | "item.completed",
+    onProgress?: RunProgressHandler,
+  ): void {
+    if (!onProgress) {
+      return;
+    }
+
+    switch (item.type) {
+      case "reasoning":
+        if (eventType === "item.started") {
+          onProgress({
+            kind: "analysis",
+            message: "正在分析问题并规划下一步...",
+          });
+        }
+        return;
+
+      case "command_execution": {
+        const command = summariseProgressText(item.command);
+        if (eventType === "item.started") {
+          onProgress({
+            kind: "command",
+            message: `正在执行命令：${command}`,
+          });
+        } else if (eventType === "item.completed") {
+          onProgress({
+            kind: "command",
+            message:
+              item.status === "failed"
+                ? `命令执行失败：${command}`
+                : `命令执行完成：${command}`,
+          });
+        }
+        return;
+      }
+
+      case "file_change":
+        if (eventType === "item.completed") {
+          const files = item.changes
+            .slice(0, 4)
+            .map((change) => change.path)
+            .join(", ");
+          onProgress({
+            kind: "file",
+            message:
+              item.status === "completed"
+                ? `已应用文件变更：${files || "无文件路径"}`
+                : "文件变更应用失败。",
+          });
+        }
+        return;
+
+      case "mcp_tool_call":
+        if (eventType === "item.started") {
+          onProgress({
+            kind: "tool",
+            message: `正在调用工具：${item.server}/${item.tool}`,
+          });
+        } else if (eventType === "item.completed" && item.status === "failed") {
+          onProgress({
+            kind: "tool",
+            message: `工具调用失败：${item.server}/${item.tool}`,
+          });
+        }
+        return;
+
+      case "web_search":
+        if (eventType === "item.started" || eventType === "item.completed") {
+          onProgress({
+            kind: "search",
+            message: `正在搜索：${summariseProgressText(item.query)}`,
+          });
+        }
+        return;
+
+      case "todo_list": {
+        if (eventType === "item.started") {
+          return;
+        }
+        const completed = item.items.filter((todo) => todo.completed).length;
+        onProgress({
+          kind: "plan",
+          message: `计划进度：${completed}/${item.items.length}`,
+        });
+        return;
+      }
+
+      case "error":
+        onProgress({
+          kind: "error",
+          message: `执行过程中出现错误：${summariseProgressText(item.message)}`,
+        });
+        return;
+
+      case "agent_message":
+        return;
+    }
+  }
+
   private enqueueForChat<T>(chatId: string, task: () => Promise<T>): Promise<T> {
     const previous = this.chatQueues.get(chatId) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(task);
@@ -267,4 +440,11 @@ export class CodexRunner {
     const message = error instanceof Error ? error.message : String(error);
     return /thread|rollout|session/i.test(message);
   }
+}
+
+function summariseProgressText(value: string): string {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  return singleLine.length > 180
+    ? `${singleLine.slice(0, 180)}...`
+    : singleLine;
 }
